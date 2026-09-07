@@ -7,6 +7,7 @@
  * holds the mapping.
  */
 
+import { BadRequestException } from '@nestjs/common';
 import { isEmpty, isNil, isPlainObject, isString } from 'lodash-es';
 import { z } from 'zod';
 import { resolveResponsesInputType } from './responses-input-type';
@@ -15,8 +16,11 @@ import { toCustomToolArguments } from '@/modules/proxy-gateway/antigravity/Custo
 import {
   OpenAIChatRequest,
   OpenAIContentPart,
+  OpenAITool,
   OpenAIToolCall,
 } from '@/modules/proxy-gateway/server/common/interfaces/request-interfaces';
+import { parseOpenAIInputAudio } from '../chat/openai-input-audio';
+import { toResponsesOpenAIResponseFormat } from '../chat/openai-response-format';
 
 export interface ResponsesRequestBody {
   model?: string;
@@ -35,6 +39,7 @@ export interface ResponsesRequestBody {
   tool_choice?: OpenAIChatRequest['tool_choice'];
   stream?: boolean;
   user?: string;
+  text?: { format?: unknown };
 }
 
 export interface OpenAIResponsesErrorBody {
@@ -109,7 +114,7 @@ const ResponsesInputItemSchema = z.preprocess(
     }
 
     if (resolveResponsesInputType(value) === 'message') {
-      return Object.assign({}, value, { type: 'message' as const });
+      return Object.assign({}, value, { type: 'message' });
     }
     return value;
   },
@@ -129,6 +134,90 @@ type ResponsesToolCallItem = Exclude<
   z.infer<typeof ResponsesMessageItemSchema> | z.infer<typeof ResponsesToolOutputItemSchema>
 >;
 
+const JsonRecordSchema = z.record(z.string(), z.unknown());
+const OpenAIToolSchema: z.ZodType<OpenAITool> = z.lazy(() =>
+  z
+    .object({
+      type: z.string(),
+      name: z.string().optional(),
+      tools: z.array(OpenAIToolSchema).optional(),
+      function: z
+        .object({
+          name: z.string(),
+          description: z.string().optional(),
+          parameters: JsonRecordSchema.optional(),
+        })
+        .optional(),
+    })
+    .catchall(z.unknown()),
+);
+const ResponsesToolChoiceSchema = z.union([
+  z.string(),
+  z.object({
+    type: z.string(),
+    function: z
+      .object({
+        name: z.string(),
+      })
+      .optional(),
+  }),
+]);
+const ResponsesRequestBodySchema = z
+  .object({
+    model: z.string().optional(),
+    instructions: z.string().optional(),
+    input: z.unknown().optional(),
+    metadata: JsonRecordSchema.optional(),
+    previous_response_id: z.string().optional(),
+    store: z.boolean().optional(),
+    tools: z.array(OpenAIToolSchema).optional(),
+    max_output_tokens: z.number().optional(),
+    temperature: z.number().optional(),
+    top_p: z.number().optional(),
+    presence_penalty: z.number().optional(),
+    frequency_penalty: z.number().optional(),
+    seed: z.number().optional(),
+    tool_choice: ResponsesToolChoiceSchema.optional(),
+    stream: z.boolean().optional(),
+    user: z.string().optional(),
+    text: z
+      .object({
+        format: z.unknown().optional(),
+      })
+      .optional(),
+  })
+  .passthrough();
+const ResponsesCompletedEventSchema = z.object({
+  type: z.literal('response.completed'),
+  response: z.unknown().optional(),
+});
+const ResponsesContentStringSchema = z.object({
+  content: z.string().optional(),
+});
+const ResponsesMessageContentBlockSchema = z.object({
+  type: z.string().optional(),
+  text: z.string().optional(),
+  image_url: z.unknown().optional(),
+  input_audio: z.unknown().optional(),
+});
+const ResponsesInputAudioSchema = z.object({
+  data: z.string(),
+  format: z.string().optional(),
+});
+const ResponsesOutputSchema = z.object({
+  content: z.string().optional(),
+});
+const ResponsesInlineDataSchema = z.object({
+  data: z.string().min(1),
+  mimeType: z.string().optional().catch(undefined),
+});
+const ResponsesSessionResponseSchema = z
+  .object({
+    id: z.string().min(1),
+    output: z.array(z.unknown()),
+  })
+  .passthrough();
+
 function parseResponsesInputItems(input: unknown[]): ResponsesInputItem[] {
   return input.flatMap((item) => {
     const parsed = parseResponsesInputItem(item);
@@ -138,6 +227,12 @@ function parseResponsesInputItems(input: unknown[]): ResponsesInputItem[] {
 
 export function parseResponsesInputItem(input: unknown): ResponsesInputItem | null {
   const parsed = ResponsesInputItemSchema.safeParse(input);
+  return parsed.success ? parsed.data : null;
+}
+
+/** Validates a Responses request transported outside the typed HTTP controller. */
+export function parseResponsesRequestBody(value: unknown): ResponsesRequestBody | null {
+  const parsed = ResponsesRequestBodySchema.safeParse(value);
   return parsed.success ? parsed.data : null;
 }
 
@@ -193,8 +288,10 @@ export function extractCompletedResponsesEvent(event: unknown): unknown | null {
   }
 
   try {
-    const parsed = toRecord(JSON.parse(dataLine.slice('data:'.length).trimStart()));
-    return parsed?.type === 'response.completed' ? (parsed.response ?? null) : null;
+    const parsed = ResponsesCompletedEventSchema.safeParse(
+      JSON.parse(dataLine.slice('data:'.length).trimStart()),
+    );
+    return parsed.success ? (parsed.data.response ?? null) : null;
   } catch {
     return null;
   }
@@ -211,8 +308,8 @@ export function normalizeResponsesInput(input: unknown): string {
         if (isString(item)) {
           return item;
         }
-        const itemRecord = toRecord(item);
-        const content = asString(itemRecord?.content);
+        const itemRecord = ResponsesContentStringSchema.safeParse(item);
+        const content = itemRecord.success ? itemRecord.data.content : undefined;
         if (content) {
           return content;
         }
@@ -366,6 +463,7 @@ export function buildResponsesChatRequest(body: ResponsesRequestBody): OpenAICha
     frequency_penalty: body.frequency_penalty,
     seed: body.seed,
     tool_choice: body.tool_choice,
+    response_format: toResponsesOpenAIResponseFormat(body.text?.format),
     stream: body.stream,
     extra: {
       ...(body.metadata ?? {}),
@@ -392,16 +490,17 @@ export function normalizeResponsesMessageContent(content: unknown): string | Ope
   }
 
   const textParts: string[] = [];
-  const imageParts: OpenAIContentPart[] = [];
+  const mediaParts: OpenAIContentPart[] = [];
 
   for (const item of content) {
-    const block = toRecord(item);
-    if (!block) {
+    const parsedBlock = ResponsesMessageContentBlockSchema.safeParse(item);
+    if (!parsedBlock.success) {
       continue;
     }
 
-    const blockType = asString(block.type);
-    if (typeof block.text === 'string') {
+    const block = parsedBlock.data;
+    const blockType = block.type;
+    if (block.text !== undefined) {
       textParts.push(block.text);
       continue;
     }
@@ -412,15 +511,34 @@ export function normalizeResponsesMessageContent(content: unknown): string | Ope
         typeof rawImageUrl === 'string' ? { url: rawImageUrl } : rawImageUrl,
       );
       if (imageUrl.success) {
-        imageParts.push({
+        mediaParts.push({
           type: 'image_url',
           image_url: imageUrl.data,
         });
       }
+      continue;
+    }
+
+    if (blockType === 'input_audio' || blockType === 'audio') {
+      const inputAudio = ResponsesInputAudioSchema.safeParse(block.input_audio);
+      if (!inputAudio.success) {
+        throw new BadRequestException(
+          'Invalid input_audio: input_audio must be an object with string data and optional string format',
+        );
+      }
+      const audioPart: OpenAIContentPart = {
+        type: 'input_audio',
+        input_audio: {
+          data: inputAudio.data.data,
+          format: inputAudio.data.format,
+        },
+      };
+      parseOpenAIInputAudio(audioPart);
+      mediaParts.push(audioPart);
     }
   }
 
-  if (imageParts.length === 0) {
+  if (mediaParts.length === 0) {
     return textParts.join('\n');
   }
 
@@ -432,7 +550,7 @@ export function normalizeResponsesMessageContent(content: unknown): string | Ope
       text: mergedText,
     });
   }
-  merged.push(...imageParts);
+  merged.push(...mediaParts);
   return merged;
 }
 
@@ -458,9 +576,9 @@ export function resolveToolArguments(item: ResponsesToolCallItem): Record<string
   if (isString(raw)) {
     try {
       const parsed = JSON.parse(raw);
-      const parsedRecord = toRecord(parsed);
-      if (parsedRecord) {
-        return parsedRecord;
+      const parsedRecord = JsonRecordSchema.safeParse(parsed);
+      if (parsedRecord.success) {
+        return parsedRecord.data;
       }
       return {
         value: parsed,
@@ -472,9 +590,9 @@ export function resolveToolArguments(item: ResponsesToolCallItem): Record<string
     }
   }
 
-  const rawRecord = toRecord(raw);
-  if (rawRecord) {
-    return rawRecord;
+  const rawRecord = JsonRecordSchema.safeParse(raw);
+  if (rawRecord.success) {
+    return rawRecord.data;
   }
 
   return {};
@@ -518,8 +636,8 @@ export function normalizeResponsesOutput(output: unknown): string {
   if (isString(output)) {
     return output;
   }
-  const outputRecord = toRecord(output);
-  const content = asString(outputRecord?.content);
+  const outputRecord = ResponsesOutputSchema.safeParse(output);
+  const content = outputRecord.success ? outputRecord.data.content : undefined;
   if (content) {
     return content;
   }
@@ -527,19 +645,6 @@ export function normalizeResponsesOutput(output: unknown): string {
     return '';
   }
   return JSON.stringify(output);
-}
-
-export function resolveImageUrl(block: Record<string, unknown>): string | null {
-  const raw = block.image_url;
-  if (isString(raw)) {
-    return raw;
-  }
-  const rawRecord = toRecord(raw);
-  const url = asString(rawRecord?.url);
-  if (url) {
-    return url;
-  }
-  return null;
 }
 
 export function resolveInlineData(
@@ -572,28 +677,20 @@ export function resolveInlineData(
     return null;
   }
 
-  const inputRecord = toRecord(input);
-  if (inputRecord) {
-    const data = asString(inputRecord.data);
-    if (!data) {
-      return null;
-    }
+  const inputRecord = ResponsesInlineDataSchema.safeParse(input);
+  if (inputRecord.success) {
     return {
-      mimeType: asString(inputRecord.mimeType) ?? defaultMimeType,
-      data,
+      mimeType: inputRecord.data.mimeType ?? defaultMimeType,
+      data: inputRecord.data.data,
     };
   }
 
   return null;
 }
 
-export function toRecord(value: unknown): Record<string, unknown> | null {
-  if (!isPlainObject(value)) {
-    return null;
-  }
-  return value as Record<string, unknown>;
-}
-
-export function asString(value: unknown): string | null {
-  return isString(value) ? value : null;
+export function parseResponsesSessionResponse(
+  response: unknown,
+): z.infer<typeof ResponsesSessionResponseSchema> | null {
+  const parsed = ResponsesSessionResponseSchema.safeParse(response);
+  return parsed.success ? parsed.data : null;
 }

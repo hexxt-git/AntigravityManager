@@ -45,18 +45,17 @@ import {
 import { parseImageMultipartRequest } from '@/modules/proxy-gateway/server/modules/openai/media/image-multipart-request';
 import { safeStringifyPacket } from '@/shared/security/sensitiveDataMasking';
 import { BaseProxyController } from '@/modules/proxy-gateway/server/common/base-proxy.controller';
+import { resolveOpenAIImageUrl } from './openai-image-url';
 import { OpenAIService } from './openai.service';
 export type { ResponsesRequestBody } from './responses/openai-responses-request';
 import {
-  asString,
   buildResponseNotFoundError,
   buildResponsesChatRequest,
   type ResponsesRequestBody,
   extractCompletedResponsesEvent,
   normalizeResponsesInputItems,
-  resolveImageUrl,
+  parseResponsesSessionResponse,
   resolveInlineData,
-  toRecord,
 } from './responses/openai-responses-request';
 
 export const IMAGE_QUOTA_REFRESH = Symbol('IMAGE_QUOTA_REFRESH');
@@ -296,15 +295,15 @@ export class OpenAIOperations extends BaseProxyController {
       throw error;
     }
 
-    const prepared = this.prepareResponsesRequest(expanded);
-    if (!prepared) {
-      res
-        .status(HttpStatus.NOT_FOUND)
-        .send(buildResponseNotFoundError(body.previous_response_id ?? ''));
-      return;
-    }
-
     try {
+      const prepared = this.prepareResponsesRequest(expanded);
+      if (!prepared) {
+        res
+          .status(HttpStatus.NOT_FOUND)
+          .send(buildResponseNotFoundError(body.previous_response_id ?? ''));
+        return;
+      }
+
       const result = await this.proxyService.handleChatCompletions(prepared.request, 'responses');
       if (body.stream && this.isObservableLike(result)) {
         this.writeSseResponse(res, this.cacheResponsesStream(result, prepared.session));
@@ -594,19 +593,17 @@ export class OpenAIOperations extends BaseProxyController {
   }
 
   private saveResponsesSession(response: unknown, session: OpenAIResponsesSession): void {
-    const responseRecord = toRecord(response);
-    const responseId = asString(responseRecord?.id);
-    const output = responseRecord?.output;
-    if (!responseId || !Array.isArray(output)) {
+    const responseRecord = parseResponsesSessionResponse(response);
+    if (!responseRecord) {
       return;
     }
 
-    this.responsesSessions.save(responseId, {
+    this.responsesSessions.save(responseRecord.id, {
       ...session,
-      inputItems: [...session.inputItems, ...output],
+      inputItems: [...session.inputItems, ...responseRecord.output],
       // `store: false` asks for nothing retrievable, so the payload is dropped
       // while the continuation history this gateway needs is kept.
-      response: session.store === false ? undefined : (responseRecord ?? undefined),
+      response: session.store === false ? undefined : responseRecord,
     });
   }
 
@@ -801,7 +798,7 @@ export class OpenAIOperations extends BaseProxyController {
           textParts.push(block.text);
         }
         if (block.type === 'image_url') {
-          const imageUrl = resolveImageUrl(block as unknown as Record<string, unknown>);
+          const imageUrl = resolveOpenAIImageUrl(block.image_url);
           const inlineData = resolveInlineData(imageUrl, 'image/png');
           if (inlineData) {
             parts.push({

@@ -1,7 +1,16 @@
 import { Notification } from 'electron';
+import { z } from 'zod';
 import { CloudAccountRepo } from '@/modules/cloud-account/persistence/cloudHandler';
 import { CloudAccountSettingsStore } from '@/modules/cloud-account/persistence/cloud-account-settings-store';
 import { GoogleAPIService, type QuotaData, type TokenResponse } from './GoogleAPIService';
+import {
+  CLOUD_ACCOUNT_REAUTH_REQUIRED_REASON,
+  CloudAccountRefreshBlockedError,
+  CloudAccountRefreshService,
+  createCloudAccountRefreshRequest,
+  isRetryableInvalidGrantRefreshError,
+} from './CloudAccountRefreshService';
+import { clearValidationHealthAfterSuccessfulProbe } from './CloudAccountHealthService';
 import { AutoSwitchService } from './AutoSwitchService';
 import { logger } from '@/shared/logging/logger';
 import { classifyAccountStatusFromError } from '@/modules/cloud-account/utils/account-status';
@@ -95,6 +104,32 @@ function resolveAutoSwitchTargets(): AntigravityAppTarget[] {
   );
 }
 
+const BooleanSettingSchema = z.boolean();
+const NumberSettingSchema = z.number();
+const StringSettingSchema = z.string();
+
+async function persistMonitorAccountStatusFromError(
+  accountId: string,
+  error: unknown,
+): Promise<void> {
+  if (isRetryableInvalidGrantRefreshError(error)) {
+    return;
+  }
+  if (error instanceof CloudAccountRefreshBlockedError) {
+    await CloudAccountRepo.setAccountStatus(
+      accountId,
+      'expired',
+      CLOUD_ACCOUNT_REAUTH_REQUIRED_REASON,
+    );
+    return;
+  }
+
+  const classified = classifyAccountStatusFromError(error);
+  if (classified) {
+    await CloudAccountRepo.setAccountStatus(accountId, classified.status, classified.reason);
+  }
+}
+
 function getCloudMonitorLanguage(language: string | null | undefined): CloudMonitorLanguage {
   const normalizedLanguage = language?.toLowerCase() ?? 'en';
   if (normalizedLanguage.startsWith('zh')) {
@@ -158,7 +193,7 @@ export class CloudMonitorService {
   private static stopEpoch = 0;
 
   private static isAutoSwitchEnabled(): boolean {
-    return CloudAccountSettingsStore.getSetting<boolean>('auto_switch_enabled', false);
+    return CloudAccountSettingsStore.getSetting('auto_switch_enabled', false, BooleanSettingSchema);
   }
 
   static configureWeeklyWarmupExecutor(executor: WeeklyWarmupExecutor): void {
@@ -291,6 +326,12 @@ export class CloudMonitorService {
 
     for (const account of accounts) {
       try {
+        if (account.health?.oauth?.refresh_blocked) {
+          continue;
+        }
+        if (account.health?.validation && Date.now() < account.health.validation.next_probe_at_ms) {
+          continue;
+        }
         now = Math.floor(Date.now() / 1000);
         // 1. Check/Refresh Token if needed (give it a 10 min buffer here for safety)
         let accessToken = account.token.access_token;
@@ -312,24 +353,15 @@ export class CloudMonitorService {
           } else {
             logger.info(`Monitor: Refreshing token for ${account.email}`);
             try {
-              const newToken = await GoogleAPIService.refreshAccessToken(
-                account.token.refresh_token,
-                account.proxy_url,
-                account.token.oauth_client_key,
+              const newToken = await CloudAccountRefreshService.refreshAccessToken(
+                createCloudAccountRefreshRequest(account),
               );
               account.token = mergeRefreshedToken(account.token, newToken, now);
               await CloudAccountRepo.updateToken(account.id, account.token);
               accessToken = newToken.access_token;
             } catch (refreshError) {
               logger.error(`Monitor: Token refresh failed for ${account.email}`, refreshError);
-              const classified = classifyAccountStatusFromError(refreshError);
-              if (classified) {
-                await CloudAccountRepo.setAccountStatus(
-                  account.id,
-                  classified.status,
-                  classified.reason,
-                );
-              }
+              await persistMonitorAccountStatusFromError(account.id, refreshError);
               continue;
             }
           }
@@ -357,10 +389,8 @@ export class CloudMonitorService {
                 `Monitor: Received 401 Unauthorized while fetching credits for ${account.email}; forcing token refresh and retry`,
               );
               try {
-                const refreshedToken = await GoogleAPIService.refreshAccessToken(
-                  account.token.refresh_token,
-                  account.proxy_url,
-                  account.token.oauth_client_key,
+                const refreshedToken = await CloudAccountRefreshService.refreshAccessToken(
+                  createCloudAccountRefreshRequest(account),
                 );
                 now = Math.floor(Date.now() / 1000);
                 account.token = mergeRefreshedToken(account.token, refreshedToken, now);
@@ -381,6 +411,7 @@ export class CloudMonitorService {
                   `Monitor: Failed to fetch credits for ${account.email} after token refresh`,
                   retryError,
                 );
+                await persistMonitorAccountStatusFromError(account.id, retryError);
                 if (previousAICredits) {
                   quota.ai_credits = previousAICredits;
                 }
@@ -397,10 +428,8 @@ export class CloudMonitorService {
             logger.warn(
               `Monitor: Received 401 Unauthorized for ${account.email}; forcing token refresh and retry`,
             );
-            const refreshedToken = await GoogleAPIService.refreshAccessToken(
-              account.token.refresh_token,
-              account.proxy_url,
-              account.token.oauth_client_key,
+            const refreshedToken = await CloudAccountRefreshService.refreshAccessToken(
+              createCloudAccountRefreshRequest(account),
             );
             now = Math.floor(Date.now() / 1000);
             account.token = mergeRefreshedToken(account.token, refreshedToken, now);
@@ -438,15 +467,18 @@ export class CloudMonitorService {
         await CloudAccountRepo.updateQuota(account.id, quota);
         account.quota = quota;
         await CloudAccountRepo.setAccountStatus(account.id, 'active', null);
+        await clearValidationHealthAfterSuccessfulProbe(account);
         account.status = 'active';
         account.status_reason = undefined;
         refreshedAccounts.push(account);
         proxyModelAvailabilityStore.clearCapabilityFailures(account.id);
       } catch (error) {
         logger.error(`Monitor: Failed to update ${account.email}`, error);
-        const classified = classifyAccountStatusFromError(error);
+        await persistMonitorAccountStatusFromError(account.id, error);
+        const classified = isRetryableInvalidGrantRefreshError(error)
+          ? null
+          : classifyAccountStatusFromError(error);
         if (classified) {
-          await CloudAccountRepo.setAccountStatus(account.id, classified.status, classified.reason);
           if (classified.status === 'rate_limited' && hasReusableCachedQuota(account)) {
             logger.warn(
               `Monitor: Quota request rate-limited for ${account.email}, keeping cached quota as fallback.`,
@@ -457,16 +489,18 @@ export class CloudMonitorService {
     }
 
     // 4. Check for Quota Alerts
-    const alertEnabled = CloudAccountSettingsStore.getSetting<boolean>(
+    const alertEnabled = CloudAccountSettingsStore.getSetting(
       'quota_alert_enabled',
       false,
+      BooleanSettingSchema,
     );
-    const alertThreshold = CloudAccountSettingsStore.getSetting<number>(
+    const alertThreshold = CloudAccountSettingsStore.getSetting(
       'quota_alert_threshold',
       20,
+      NumberSettingSchema,
     );
     const notificationLanguage = getCloudMonitorLanguage(
-      CloudAccountSettingsStore.getSetting<string>('language', 'en'),
+      CloudAccountSettingsStore.getSetting('language', 'en', StringSettingSchema),
     );
     const notificationText = CLOUD_MONITOR_NOTIFICATION_TEXT[notificationLanguage];
 
@@ -490,13 +524,15 @@ export class CloudMonitorService {
     }
 
     // Check for AI Credits Alerts
-    const aiCreditsAlertEnabled = CloudAccountSettingsStore.getSetting<boolean>(
+    const aiCreditsAlertEnabled = CloudAccountSettingsStore.getSetting(
       'ai_credits_alert_enabled',
       false,
+      BooleanSettingSchema,
     );
-    const aiCreditsAlertThreshold = CloudAccountSettingsStore.getSetting<number>(
+    const aiCreditsAlertThreshold = CloudAccountSettingsStore.getSetting(
       'ai_credits_alert_threshold',
       5000,
+      NumberSettingSchema,
     );
 
     if (aiCreditsAlertEnabled) {

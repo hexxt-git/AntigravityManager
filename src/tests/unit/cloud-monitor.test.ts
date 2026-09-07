@@ -1,4 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { z } from 'zod';
 import { CloudMonitorService } from '@/modules/cloud-account/services/CloudMonitorService';
 import { CloudAccountRepo } from '@/modules/cloud-account/persistence/cloudHandler';
 import { CloudAccountSettingsStore } from '@/modules/cloud-account/persistence/cloud-account-settings-store';
@@ -45,7 +46,7 @@ describe('CloudMonitorService', () => {
     );
     CloudMonitorService.resetStateForTesting();
     vi.mocked(CloudAccountSettingsStore.readSetting).mockImplementation((key) =>
-      CloudAccountSettingsStore.getSetting(key, undefined),
+      CloudAccountSettingsStore.getSetting(key, undefined, z.unknown()),
     );
   });
 

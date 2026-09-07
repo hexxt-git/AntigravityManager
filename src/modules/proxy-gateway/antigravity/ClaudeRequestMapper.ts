@@ -3,7 +3,7 @@ import { v4 as uuidv4 } from 'uuid';
 import { isEmpty, isPlainObject, isString, sortBy } from 'lodash-es';
 import { mapClaudeModelToGemini, normalizeGeminiModelAlias } from './ModelMapping';
 import { getMaxOutputTokens, getThinkingBudget } from './ModelSpecs';
-import { cleanJsonSchema, normalizeObjectJsonSchema } from './JsonSchemaUtils';
+import { normalizeObjectJsonSchema, type JsonSchemaMap } from './JsonSchemaUtils';
 import { SignatureStore } from './SignatureStore';
 import {
   isGeminiFlashModel,
@@ -59,6 +59,8 @@ const TOOL_SCHEMA_CACHE_LIMIT = 100;
 const TOOL_SCHEMA_CACHE_TTL_MS = 30 * 60 * 1000;
 let placeholderSignatureUsageCount = 0;
 
+const CLAUDE_AGENT_SDK_IDENTITY = "You are a Claude agent, built on Anthropic's Claude Agent SDK.";
+const CLAUDE_CODE_IDENTITY = "You are Claude Code, Anthropic's official CLI for Claude.";
 /**
  * How often the proxy fell back to the placeholder instead of a real thought
  * signature, counted once per request that used it at least once (not once per
@@ -82,7 +84,7 @@ const SAFETY_SETTINGS: SafetySetting[] = [
 ];
 
 interface ToolSchemaCacheEntry {
-  declarationsJson: string;
+  declarations: FunctionDeclaration[];
   hitCount: number;
   timestamp: number;
 }
@@ -126,7 +128,7 @@ export function transformClaudeRequestIn(
 
   // Convert Claude tools to Tool array for networking detection
   const normalizedTools: Tool[] | undefined = claudeReq.tools
-    ? (JSON.parse(JSON.stringify(claudeReq.tools)) as Tool[])
+    ? structuredClone(claudeReq.tools)
     : undefined;
 
   // Resolve grounding config
@@ -521,7 +523,7 @@ function resolveAdaptiveThinkingLevel(claudeReq: ClaudeRequest): 'low' | 'medium
   return 'high';
 }
 
-function toToolSchema(schema: unknown): Record<string, unknown> {
+function toToolSchema(schema: unknown): JsonSchemaMap {
   return normalizeObjectJsonSchema(schema);
 }
 
@@ -602,6 +604,11 @@ function injectGoogleSearchTool(body: { tools?: GeminiToolDeclaration[] }, mappe
  * Builds system instruction
  * Converts Claude system prompts to Gemini format with a default assistant identity directive.
  */
+
+function normalizeClaudeClientIdentity(text: string): string {
+  return text === CLAUDE_AGENT_SDK_IDENTITY ? CLAUDE_CODE_IDENTITY : text;
+}
+
 function buildSystemInstruction(
   system: ClaudeRequest['system'],
   extraSystemMessages: string[],
@@ -616,11 +623,13 @@ function buildSystemInstruction(
 
   if (system) {
     if (isString(system)) {
-      instructions.push(sanitizeSystemInstructionForCache(system));
+      instructions.push(sanitizeSystemInstructionForCache(normalizeClaudeClientIdentity(system)));
     } else if (Array.isArray(system)) {
       for (const block of system) {
         if (block.type === 'text') {
-          instructions.push(sanitizeSystemInstructionForCache(block.text));
+          instructions.push(
+            sanitizeSystemInstructionForCache(normalizeClaudeClientIdentity(block.text)),
+          );
         }
       }
     }
@@ -710,14 +719,13 @@ function buildContents(
         }
       } else if (block.type === 'thinking') {
         const part: GeminiPart = { text: block.thinking, thought: true };
-        cleanJsonSchema(part);
         if (block.signature) {
           lastThoughtSignature = block.signature;
           part.thoughtSignature = block.signature;
           part.thought_signature = block.signature;
         }
         parts.push(part);
-      } else if (block.type === 'image' || block.type === 'document') {
+      } else if (block.type === 'image' || block.type === 'document' || block.type === 'audio') {
         // Images and documents differ only in what the client called them; the
         // provider takes both as one inline part carrying its own MIME type.
         if (block.source.type === 'base64')
@@ -728,7 +736,6 @@ function buildContents(
         const part: GeminiPart = {
           functionCall: { name: block.name, args: block.input, id: block.id },
         };
-        cleanJsonSchema(part);
         toolIdToName.set(block.id, block.name);
         const finalSig =
           block.signature ||
@@ -754,14 +761,14 @@ function buildContents(
         if (isString(block.content)) mergedContent = block.content;
         else if (Array.isArray(block.content))
           mergedContent = block.content
-            .filter((b: any) => b.type === 'text')
-            .map((b: any) => b.text)
+            .filter((content): content is { type: 'text'; text: string } => content.type === 'text')
+            .map((content) => content.text)
             .join('\n');
         if (isEmpty(mergedContent.trim()))
           mergedContent = block.is_error
             ? 'Tool execution failed with no output.'
             : 'Command executed successfully.';
-        const part: any = {
+        const part: GeminiPart = {
           functionResponse: {
             name: funcName,
             response: { result: mergedContent },
@@ -886,16 +893,11 @@ function lookupToolSchemaCache(key: string): FunctionDeclaration[] | null {
   }
 
   try {
-    const declarations = JSON.parse(entry.declarationsJson) as FunctionDeclaration[];
-    if (!Array.isArray(declarations)) {
-      toolSchemaCache.delete(key);
-      return null;
-    }
     entry.hitCount += 1;
     logger.debug(
-      `[ToolSchemaCache] HIT hash=${key.slice(0, 16)} hitCount=${entry.hitCount} declarations=${declarations.length}`,
+      `[ToolSchemaCache] HIT hash=${key.slice(0, 16)} hitCount=${entry.hitCount} declarations=${entry.declarations.length}`,
     );
-    return declarations;
+    return structuredClone(entry.declarations);
   } catch {
     toolSchemaCache.delete(key);
     return null;
@@ -905,7 +907,7 @@ function lookupToolSchemaCache(key: string): FunctionDeclaration[] | null {
 function cacheToolSchemas(key: string, declarations: FunctionDeclaration[]): void {
   try {
     toolSchemaCache.set(key, {
-      declarationsJson: JSON.stringify(declarations),
+      declarations: structuredClone(declarations),
       hitCount: 0,
       timestamp: Date.now(),
     });
@@ -974,8 +976,12 @@ function buildGenerationConfig(
 
   // JSON mode is a request-shaping flag, not an OpenAI-only nicety: whoever asks for it parses
   // the answer, so the model has to be told before it answers rather than corrected afterwards.
-  if (String(claudeReq.response_format?.type ?? '').toLowerCase() === 'json_object') {
+  const responseFormatType = String(claudeReq.response_format?.type ?? '').toLowerCase();
+  if (responseFormatType === 'json_object') {
     config.responseMimeType = 'application/json';
+  } else if (responseFormatType === 'json_schema' && claudeReq.response_format?.json_schema) {
+    config.responseMimeType = 'application/json';
+    config.responseSchema = normalizeObjectJsonSchema(claudeReq.response_format.json_schema.schema);
   }
 
   if (isOpenAIPath) {
